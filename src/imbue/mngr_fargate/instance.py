@@ -431,51 +431,52 @@ class FargateProviderInstance(BaseProviderInstance):
         if str(host_id) in self._host_cache:
             return
 
-        # Extract IP
-        public_ip = None
-        for attachment in task.get("attachments", []):
-            if attachment.get("type") == "ElasticNetworkInterface":
-                for detail in attachment.get("details", []):
-                    if detail.get("name") == "networkInterfaceId":
-                        eni_id = detail["value"]
-                        eni_resp = self.fargate_client._ec2.describe_network_interfaces(
-                            NetworkInterfaceIds=[eni_id]
-                        )
-                        for ni in eni_resp.get("NetworkInterfaces", []):
-                            public_ip = ni.get("Association", {}).get("PublicIp")
+        # Extract IP — may fail if ENI is already gone
+        try:
+            public_ip = None
+            for attachment in task.get("attachments", []):
+                if attachment.get("type") == "ElasticNetworkInterface":
+                    for detail in attachment.get("details", []):
+                        if detail.get("name") == "networkInterfaceId":
+                            eni_id = detail["value"]
+                            eni_resp = self.fargate_client._ec2.describe_network_interfaces(
+                                NetworkInterfaceIds=[eni_id]
+                            )
+                            for ni in eni_resp.get("NetworkInterfaces", []):
+                                public_ip = ni.get("Association", {}).get("PublicIp")
+                            break
+
+            if not public_ip:
+                for container in task.get("containers", []):
+                    for ni in container.get("networkInterfaces", []):
+                        public_ip = ni.get("privateIpv4Address")
                         break
 
-        if not public_ip:
-            # Try private IP
-            for container in task.get("containers", []):
-                for ni in container.get("networkInterfaces", []):
-                    public_ip = ni.get("privateIpv4Address")
-                    break
+            if not public_ip:
+                return
 
-        if not public_ip:
-            return
+            profile_dir = self.mngr_ctx.profile_dir / "fargate"
+            ssh_key_path = profile_dir / "fargate_ssh_key" / "ssh_key"
+            if not ssh_key_path.exists():
+                return
 
-        # Check if we can connect
-        profile_dir = self.mngr_ctx.profile_dir / "fargate"
-        ssh_key_path = profile_dir / "fargate_ssh_key"
-        if not ssh_key_path.exists():
-            return
+            known_hosts_path = profile_dir / "known_hosts"
+            _scan_and_add_host_key(public_ip, 22, known_hosts_path)
 
-        known_hosts_path = profile_dir / "known_hosts"
-        _scan_and_add_host_key(public_ip, 22, known_hosts_path)
+            pyinfra_host = create_pyinfra_host(
+                hostname=public_ip,
+                port=22,
+                private_key_path=ssh_key_path,
+                known_hosts_path=known_hosts_path,
+            )
 
-        pyinfra_host = create_pyinfra_host(
-            hostname=public_ip,
-            port=22,
-            private_key_path=ssh_key_path,
-            known_hosts_path=known_hosts_path,
-        )
+            host = Host(
+                id=host_id,
+                connector=PyinfraConnector(pyinfra_host),
+                provider_instance=self,
+                mngr_ctx=self.mngr_ctx,
+            )
 
-        host = Host(
-            id=host_id,
-            connector=PyinfraConnector(pyinfra_host),
-            provider_instance=self,
-            mngr_ctx=self.mngr_ctx,
-        )
-
-        self._host_cache[str(host_id)] = host
+            self._host_cache[str(host_id)] = host
+        except Exception as e:
+            logger.debug("Failed to cache running task {}: {}", host_id, e)
