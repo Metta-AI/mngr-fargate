@@ -41,18 +41,30 @@ from imbue.mngr.primitives import SnapshotId
 from imbue.mngr.primitives import SnapshotName
 from imbue.mngr.primitives import VolumeId
 from imbue.mngr.providers.base_provider import BaseProviderInstance
-from imbue.mngr.providers.ssh_host_setup import REQUIRED_HOST_PACKAGES
-from imbue.mngr.providers.ssh_host_setup import build_add_authorized_keys_command
-from imbue.mngr.providers.ssh_host_setup import build_add_known_hosts_command
-from imbue.mngr.providers.ssh_host_setup import build_check_and_install_packages_command
-from imbue.mngr.providers.ssh_host_setup import build_configure_ssh_command
-from imbue.mngr.providers.ssh_host_setup import build_start_activity_watcher_command
-from imbue.mngr.providers.ssh_utils import add_host_to_known_hosts
 from imbue.mngr.providers.ssh_utils import create_pyinfra_host
 from imbue.mngr.providers.ssh_utils import load_or_create_ssh_keypair
 from imbue.mngr.providers.ssh_utils import wait_for_sshd
 from imbue.mngr_fargate.config import FargateProviderConfig
 from imbue.mngr_fargate.ecs_client import FargateClient
+
+
+def _scan_and_add_host_key(hostname: str, port: int, known_hosts_path: Path) -> None:
+    """Use ssh-keyscan to get host keys and write them to known_hosts."""
+    import subprocess
+
+    known_hosts_path.parent.mkdir(parents=True, exist_ok=True)
+
+    port_arg = ["-p", str(port)] if port != 22 else []
+    result = subprocess.run(
+        ["ssh-keyscan", *port_arg, hostname],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        with open(known_hosts_path, "a") as f:
+            f.write(result.stdout)
+        logger.debug("Added host keys for {} to {}", hostname, known_hosts_path)
+    else:
+        logger.warning("ssh-keyscan failed for {}:{}", hostname, port)
 
 
 class FargateHostRecord:
@@ -131,7 +143,7 @@ class FargateProviderInstance(BaseProviderInstance):
         snapshot: SnapshotName | None = None,
     ) -> Host:
         """Create and start a new Fargate task as a mngr host."""
-        host_id = HostId(str(uuid4()))
+        host_id = HostId(f"host-{uuid4().hex}")
 
         # Generate SSH keypair for this provider
         profile_dir = self.mngr_ctx.profile_dir / "fargate"
@@ -178,15 +190,18 @@ class FargateProviderInstance(BaseProviderInstance):
 
         # Wait for SSH to be ready
         logger.info("Waiting for SSH on {}:{}...", ssh_host, ssh_port)
-        add_host_to_known_hosts(ssh_host, ssh_port, profile_dir / "known_hosts")
         wait_for_sshd(ssh_host, ssh_port, timeout_seconds=120)
+
+        # Scan host keys and add to known_hosts
+        known_hosts_path = profile_dir / "known_hosts"
+        _scan_and_add_host_key(ssh_host, ssh_port, known_hosts_path)
 
         # Create pyinfra host connector
         pyinfra_host = create_pyinfra_host(
             hostname=ssh_host,
             port=ssh_port,
-            user="root",
-            key_path=ssh_key_path,
+            private_key_path=ssh_key_path,
+            known_hosts_path=known_hosts_path,
         )
 
         # Build certified data
@@ -220,26 +235,7 @@ class FargateProviderInstance(BaseProviderInstance):
         host.execute_idempotent_command(f"mkdir -p {self.host_dir}")
         host.set_certified_data(certified_data)
 
-        # Set up SSH: install packages, configure sshd, add authorized keys
-        setup_commands = [
-            build_check_and_install_packages_command(REQUIRED_HOST_PACKAGES),
-            build_configure_ssh_command(),
-        ]
-        if authorized_keys:
-            setup_commands.append(
-                build_add_authorized_keys_command(list(authorized_keys))
-            )
-        if known_hosts:
-            setup_commands.append(
-                build_add_known_hosts_command(list(known_hosts))
-            )
-        setup_commands.append(build_start_activity_watcher_command(self.host_dir))
-
-        for cmd in setup_commands:
-            host.execute_idempotent_command(cmd)
-
-        # Record activity
-        host.record_activity(ActivitySource.CREATE)
+        # Record boot activity
         host.record_activity(ActivitySource.BOOT)
 
         # Cache the host
