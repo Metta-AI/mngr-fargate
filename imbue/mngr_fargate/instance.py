@@ -461,11 +461,14 @@ class FargateProviderInstance(BaseProviderInstance):
         if not ssh_key_path.exists():
             return
 
+        known_hosts_path = profile_dir / "known_hosts"
+        _scan_and_add_host_key(public_ip, 22, known_hosts_path)
+
         pyinfra_host = create_pyinfra_host(
             hostname=public_ip,
             port=22,
-            user="root",
-            key_path=ssh_key_path,
+            private_key_path=ssh_key_path,
+            known_hosts_path=known_hosts_path,
         )
 
         host = Host(
