@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     sudo \
     ca-certificates \
+    ncurses-term \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure sshd
